@@ -34,9 +34,15 @@ def drive(script):
     audio = ps.NullAudio()
     fake = FakeInput(script)
     gate = ps.StrokeGate()
-    # Advance the script one step per poll without real sleeping.
-    orig_sleep = lambda _s: setattr(fake, "i", fake.i + 1)
-    ps.run(fake, audio, gate=gate, sleep=orig_sleep, max_polls=len(script))
+    # Advance the script and a fake clock (POLL_S per poll) together.
+    t = [0.0]
+
+    def advance(_s):
+        fake.i += 1
+        t[0] += ps.POLL_S
+
+    ps.run(fake, audio, gate=gate, sleep=advance, max_polls=len(script),
+           clock=lambda: t[0])
     return audio, gate
 
 
@@ -104,13 +110,94 @@ def main():
     stroke = ([(True, False, (0.0, 0.0), False)]
               + [(True, True, (float(x * 8), 0.0), False) for x in range(1, 5)])
     fake_in = FakeInput(stroke)
+    t2 = [0.0]
+
+    def advance2(_s):
+        fake_in.i += 1
+        t2[0] += ps.POLL_S
+
     try:
-        ps.run(fake_in, BrokenAudio(), sleep=lambda _s: setattr(fake_in, "i", fake_in.i + 1),
-               max_polls=len(stroke))
+        ps.run(fake_in, BrokenAudio(), sleep=advance2, max_polls=len(stroke),
+               clock=lambda: t2[0])
         propagated = False
     except ps.AudioError:
         propagated = True
     ok &= check("run() propagates AudioError", propagated)
+
+    # --volume: parsing, gain math, once-per-launch preparation.
+    ok &= check("parse --test-audio --volume 50",
+                ps.parse_args(["--test-audio", "--volume", "50"]) == (True, 50))
+    ok &= check("parse default volume 100", ps.parse_args([]) == (False, 100))
+    for bad in (["--volume", "101"], ["--volume", "-1"], ["--volume", "x"], ["--bogus"]):
+        try:
+            ps.parse_args(bad)
+            rejected = False
+        except ps.AudioError:
+            rejected = True
+        ok &= check(f"parse rejects {bad}", rejected)
+
+    import math as _math
+    import struct as _struct
+    import wave as _wave
+
+    def rms_of(path):
+        with _wave.open(path, "rb") as wf:
+            data = wf.readframes(wf.getnframes())
+        vals = _struct.unpack(f"<{len(data) // 2}h", data)
+        return _math.sqrt(sum(v * v for v in vals) / max(1, len(vals))), max(
+            (abs(v) for v in vals), default=0)
+
+    base_rms, _ = rms_of(ps.WAV_PATH)
+    half_path, half_owned = ps.prepare_scaled_wav(ps.WAV_PATH, 50)
+    half_rms, _ = rms_of(half_path)
+    ok &= check("volume 50 halves RMS (same gain test-audio/drawing)",
+                bool(half_owned and abs(half_rms / base_rms - 0.5) < 0.02))
+    zero_path, _ = ps.prepare_scaled_wav(ps.WAV_PATH, 0)
+    zero_rms, zero_peak = rms_of(zero_path)
+    ok &= check("volume 0 is silent (all-zero samples)", zero_rms == 0.0 and zero_peak == 0)
+    ok &= check("volume 100 reuses original WAV (no copy)",
+                ps.prepare_scaled_wav(ps.WAV_PATH, 100) == (ps.WAV_PATH, False))
+
+    fake50 = FakeWinsound()
+    backend50 = ps.WinsoundAudio(ps.WAV_PATH, winsound_mod=fake50, volume=50)
+    first_path = backend50.play_path
+    backend50.play(); backend50.pause(); backend50.play()
+    ok &= check("gain prepared once per launch (path stable across strokes)",
+                backend50.play_path == first_path
+                and all(c[0] in (first_path, None) for c in fake50.calls))
+    backend50.close()
+    import os as _os
+    ok &= check("prepared temp copy cleaned up on close", not _os.path.exists(first_path))
+    for p in (half_path, zero_path):
+        _os.remove(p)
+
+    # Latency evidence: windowed slow onset, WAV lead-in, stats separation.
+    win = ps.MovementWindow()
+    onset_ms = None
+    for step in range(1, 40):  # 30 px/s in 10 ms polls = 0.3 px/poll
+        path, speed = win.add(step * ps.POLL_S, (step * 0.3, 0.0))
+        if path >= ps.MOVE_MIN_PX and speed >= ps.SPEED_MIN_PX_S:
+            onset_ms = step * ps.POLL_S * 1000
+            break
+    ok &= check(f"slow 30px/s stroke registers (onset {onset_ms and round(onset_ms)}ms, "
+                f"old per-poll rule: never below 100px/s)",
+                onset_ms is not None and onset_ms <= 80)
+    win2 = ps.MovementWindow()
+    still = [win2.add(i * ps.POLL_S, (10.0, 10.0)) for i in range(20)]
+    ok &= check("stationary hold window stays zero (no onset trade-off)",
+                still[-1] == (0.0, 0.0))
+    with _wave.open(ps.WAV_PATH, "rb") as wf:
+        sr = wf.getframerate()
+        data = wf.readframes(wf.getnframes())
+    vals = _struct.unpack(f"<{len(data) // 2}h", data)
+    k = int(sr * 0.005)
+    first_rms = _math.sqrt(sum(v * v for v in vals[:k]) / k)
+    ok &= check(f"WAV lead-in ~0ms (first 5ms RMS {first_rms:.0f} >= 50% overall "
+                f"{base_rms:.0f})", first_rms >= 0.5 * base_rms)
+    stats = ps.LatencyStats()
+    stats.record(1.000, 1.004)
+    ok &= check("latency stats report code-side ms only",
+                "avg=4.0ms" in stats.summary() and "audible onset not included" in stats.summary())
 
     # End-to-end through the poll loop: stroke, lift, Alt-Tab.
     script = (

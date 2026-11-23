@@ -4,8 +4,10 @@ A quiet looping pencil scratch that plays **only** while Clip Studio Paint is
 in the foreground, the left button (mouse or pen acting as mouse) is held,
 and the pointer is moving. It stops on a pause mid-stroke, on button
 release, on Alt-Tab away from Clip Studio, when muted (F9), and on exit.
-Playback is fixed-volume `winsound.PlaySound` looping; **speed-based volume
-is not implemented** in this pass.
+Playback is `winsound.PlaySound` looping at an app-only `--volume 0-100`
+(100 = the WAV's own level, 0 = silent; gain baked into one prepared copy
+at launch, never per stroke; Windows/device volume untouched).
+**Speed-based volume is not implemented.**
 
 > **Why the backend changed:** the first Windows test detected button-down +
 > movement with Clip Studio in the foreground and showed "Unmuted", but the
@@ -58,7 +60,7 @@ while building this prototype, and the prototype never changes them.
 
 | File | Purpose |
 |---|---|
-| `pencil_sound.py` | The prototype (Windows; stdlib only). Polls input, gates playback, loops the WAV at fixed volume via `winsound`. `--test-audio` plays the WAV 4 s with no Clip Studio/input needed. Speed-based volume not implemented. |
+| `pencil_sound.py` | The prototype (Windows; stdlib only). Polls input, gates playback, loops via `winsound` at `--volume 0-100`. `--test-audio` plays the WAV 4 s with no Clip Studio/input needed. Prints code-side onset latency on exit. Speed-based volume not implemented. |
 | `check_input.py` | Probe: prints lines while button-down + movement is seen, so you can tell whether the **pen** (not just the mouse) is visible to plain left-button polling. |
 | `generate_wav.py` | Regenerates `pencil_loop.wav` (original synthesis, CC0). |
 | `pencil_loop.wav` | 2.5 s seamless mono loop, deliberately quiet. |
@@ -66,29 +68,70 @@ while building this prototype, and the prototype never changes them.
 
 ## Run it (Windows PC)
 
-Launch/exit: from this folder run `python pencil_sound.py`, draw in Clip
-Studio Paint, press **F9** to mute/unmute, and **Ctrl+C** to exit.
+Launch/exit: from this folder run `python pencil_sound.py --volume 50`
+(try 30–70 to taste; omit for full WAV level), draw in Clip Studio Paint,
+press **F9** to mute/unmute, and **Ctrl+C** to exit — on exit it prints
+the measured code-side onset latency (`Latency (code side): …`).
 
 Requires Python 3 on the Windows PC (standard library only). Test on a
 **blank canvas**, not a real artwork.
 
+## Latency: what was measured, what changed
+
+Two different delays must not be conflated:
+
+- **Code side** — observed button-down + motion → the `PlaySound` call.
+  The app now measures this per stroke onset and prints avg/max on exit.
+- **Audible onset** — the call → sound leaving the speaker (Windows audio
+  stack/device). Code cannot observe this; only the Windows retest can,
+  e.g. by comparing perceived delay against `--test-audio`, which plays
+  immediately with no input involved.
+
+Measurements taken on the bundled WAV and the old constants (Mac, before
+this change):
+
+| Suspect | Measured | Verdict |
+|---|---|---|
+| WAV lead-in | First 5 ms RMS 2620 vs 2575 overall (≈102%); reaches 50% RMS at 0 ms | **Not a cause** — the loop starts at full texture; WAV unchanged |
+| 20 ms polling | Average wait ≈10 ms, worst 20 ms | Minor contributor; poll is now 10 ms (avg ≈5 ms) |
+| 2 px per single poll | Needs ≥100 px/s within one poll; a 30 px/s start moves 0.6 px/poll and **never** triggers | **Dominant code-side cause for slow starts.** Movement is now judged over a 60 ms sliding window (path ≥1.5 px and speed ≥20 px/s): a 30 px/s start registers in ≈70 ms in tests, stationary hold still measures exactly 0 |
+
+No responsiveness was traded for noise: the automated tests re-verify
+hover, stationary hold, mute, lift, and Alt-Tab after the change.
+
+## Sound reference (Facebook Reel)
+
+The target Reel (`facebook.com/reel/2409174939892566`) was fetched from
+here but only returned a login shell — **its audio could not be heard**,
+so no tone/texture was copied or guessed from it. The current sound
+remains the original synthesized loop. To match the reference, drop a
+short clip (5–10 s WAV/MP3 of the target sound alone) into this folder
+and say so; it will be analyzed and re-synthesized as an original, never
+ripped.
+
 ## To test on the Windows PC
 
-0. `python pencil_sound.py --test-audio` — **first, always.** It plays the
-   WAV for 4 s with no Clip Studio and no drawing. You must hear the quiet
-   scratch and see it finish with no `ERROR:` line (exit code 0). If it
-   prints `ERROR:` / exits 3, sound output itself is broken — fix the
-   output device/mixer and re-run before touching the steps below. If it
-   finishes cleanly but you heard nothing, say so in the report; do not
-   proceed as if audio works.
+0. Stand-alone volume ladder — **first, always** (no Clip Studio, no
+   drawing):
+   - `python pencil_sound.py --test-audio --volume 100` — hear the scratch at WAV level, no `ERROR:` (exit 0).
+   - `python pencil_sound.py --test-audio --volume 50` — clearly quieter, same scratch.
+   - `python pencil_sound.py --test-audio --volume 0` — must be **silent** for 4 s.
+   If any prints `ERROR:` / exits 3, sound output itself is broken — fix
+   the output device/mixer and re-run. If one finishes cleanly but you
+   heard nothing (or heard something at 0), say so; do not proceed as if
+   audio works. Note: drawing mode and `--test-audio` share this gain.
 1. `python check_input.py` — draw ~5 s with the pen on a blank canvas, then
    ~5 s with the mouse. Pen lines appearing = pen is visible to this method.
    If the pen draws but prints nothing, note the tablet model/driver/mode in
    the table above; the prototype's polling cannot see that pen, and the
    mouse result must not be read as pen support.
-2. `python pencil_sound.py` — run the matrix below for pen, then mouse,
-   on a blank canvas. Pen and mouse are separate columns; a mouse pass
-   never proves pen support.
+2. `python pencil_sound.py --volume 50` — run the matrix below for pen,
+   then mouse, on a blank canvas. State which device each column used;
+   the previous drawing test's device was unconfirmed, and a mouse pass
+   never proves pen support. On Ctrl+C, copy the printed
+   `Latency (code side): …` line into the report, and separately say
+   whether the *audible* onset still feels delayed (that half is the
+   Windows audio path, not visible to the code-side number).
 
 ## Known limitation: canvas vs UI false positives
 
@@ -101,14 +144,17 @@ Clip Studio internals, which is out of scope for a no-admin prototype.)
 
 ## Test results
 
-Mac (this machine) — gating logic + fake-winsound backend, `python3
-test_logic.py`: **all pass** (hover quiet, stationary hold quiet, moving
-stroke sounds, release stops, foreground loss stops, mute silences,
-correct async+loop flags, stop purges, playback failure raises
-`AudioError`, `--test-audio` success/failure exit codes, `run()`
-propagates playback errors). No real audio was heard in these tests — a
-fake `winsound` module records calls. On Mac, `--test-audio` itself exits
-2 ("requires Windows"), which is correct, not a pass.
+Mac (this machine) — `python3 test_logic.py`: **all pass.** In addition
+to the earlier gating/backend checks, they now prove: `--volume` parsing
+and rejection of bad values; volume 50 exactly halves WAV RMS and volume
+0 is all-zero samples (same preparation path for `--test-audio` and
+drawing); gain is prepared once per launch and the temp copy is cleaned
+up on close; a slow 30 px/s stroke registers in ≈70 ms under the windowed
+rule (the old per-poll rule could never fire below 100 px/s) while a
+stationary hold still measures exactly 0; the WAV lead-in measures ~0 ms.
+They do **not** prove anything audible or Windows-specific: a fake
+`winsound` records calls, and on Mac `--test-audio` exits 2 ("requires
+Windows"), which is correct, not a pass.
 
 Windows PC — what actually ran, and what was heard:
 
@@ -117,19 +163,25 @@ Windows PC — what actually ran, and what was heard:
   was heard**. The probe device is **unconfirmed** (pen vs mouse unknown),
   so this says nothing about pen support. Verdict for that backend: **fail
   (silent playback)** — now replaced.
-- *New winsound backend:* **not yet run or heard on Windows.** Until
-  `--test-audio` is heard on that PC, every row below stays Not tested.
+- *Second test (winsound backend, `e469ff9`):* the tester **heard the
+  stand-alone audio** (`--test-audio`) — that half now works. During
+  drawing they reported a **slight delay** and asked for quieter output.
+  The drawing-test device is **unconfirmed**, and per-device drawing
+  results (onset, lift, Alt-Tab, pressure) were not separately reported,
+  so the matrix below remains Not tested for this build.
+- *This build (volume + latency):* **not yet run or heard on Windows.**
 
 Per-device matrix to fill in (`Pass` / `Fail` / `Not tested`), pen and
 mouse separately, blank canvas:
 
 | Behaviour (blank canvas) | Pen | Mouse |
 |---|---|---|
-| `--test-audio` heard, no `ERROR:` | Not tested | Not tested |
+| `--test-audio --volume 100` heard / `--volume 50` quieter / `--volume 0` silent | Not tested | Not tested |
+| Drawing onset: starts promptly, no obvious delay (quote the printed code-side Latency line) | Not tested | Not tested |
 | Hover: quiet | Not tested | Not tested |
 | Stationary hold: quiet | Not tested | Not tested |
-| Slow stroke: quiet, natural scratch | Not tested | Not tested |
-| Fast stroke: same fixed volume (speed volume not implemented), still natural | Not tested | Not tested |
+| Slow stroke: quiet, natural scratch (starts without waiting for speed) | Not tested | Not tested |
+| Fast stroke: same app volume (speed volume not implemented), still natural | Not tested | Not tested |
 | Lift mid-stroke / pause: sound stops | Not tested | Not tested |
 | Alt-Tab away: sound stops; back: stays quiet until next stroke | Not tested | Not tested |
 | F9 mute: silent; unmute resumes normally; Ctrl+C exit stops sound | Not tested | Not tested |
@@ -137,6 +189,8 @@ mouse separately, blank canvas:
 | UI-drag false positives noted (sliders/title bar) | Not tested | Not tested |
 
 Current honest summary: pen — **not tested**; mouse on Windows — **not
-tested**; Mac logic/backend-unit tests — **pass** (simulated, nothing
-heard). The one confirmed Windows fact is negative: the old backend was
-silent despite visible input and "Unmuted".
+tested** (as named devices; one unconfirmed-device drawing report of
+slight delay exists); Mac automated tests — **pass** (simulated, nothing
+heard). Confirmed Windows facts: the old backend was silent despite
+visible input and "Unmuted"; the winsound stand-alone audio was heard;
+the Facebook Reel reference could not be accessed from here.

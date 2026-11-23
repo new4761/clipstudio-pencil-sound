@@ -7,9 +7,11 @@ Plays a quiet looping scratch ONLY while all of these are true:
   * the pointer is actually moving.
 
 It stops on pause, button release, foreground loss (e.g. Alt-Tab), mute
-(F9), and exit. Playback is fixed-volume `winsound.PlaySound` looping;
-speed-based volume is NOT implemented in this pass. It only *polls* input
-state (GetAsyncKeyState / GetCursorPos); it never injects, hooks, or blocks
+(F9), and exit. Playback is `winsound.PlaySound` looping at an app-only
+volume (`--volume 0-100`; 100 = WAV's own level, 0 = silent; Windows
+volume/settings untouched; gain applied once per launch, not per stroke).
+Speed-based volume is NOT implemented. It only *polls* input state
+(GetAsyncKeyState / GetCursorPos); it never injects, hooks, or blocks
 input. No admin rights, no driver or settings changes, no auto-start:
 run it, draw, Ctrl+C to quit. `--test-audio` plays the WAV for 4 seconds
 with no Clip Studio or input needed, to verify sound output itself.
@@ -24,15 +26,20 @@ logic can be verified; it makes no claim about pen support there.
 """
 import math
 import os
+import struct
 import sys
+import tempfile
 import time
+import wave
+from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WAV_PATH = os.path.join(HERE, "pencil_loop.wav")
 
-POLL_S = 0.02            # 50 Hz polling
-MOVE_MIN_PX = 2.0        # ignore sub-pixel jitter
-SPEED_MIN_PX_S = 15.0    # below this the stroke counts as stationary
+POLL_S = 0.01            # 100 Hz polling (was 20 ms; halving measured below)
+WINDOW_S = 0.06          # movement is judged over this sliding window
+MOVE_MIN_PX = 1.5        # windowed path length; ignores sub-pixel jitter
+SPEED_MIN_PX_S = 20.0    # windowed speed below this counts as stationary
 
 VK_LBUTTON = 0x01
 VK_F9 = 0x78
@@ -56,22 +63,108 @@ class StrokeGate:
         return want
 
 
+class MovementWindow:
+    """Path length and speed over a sliding window, not a single poll.
+
+    The old per-poll check needed >=2 px inside one 20 ms poll, i.e. a
+    >=100 px/s stroke, so slow stroke starts were never/were late to be
+    seen. Windowing keeps stationary-hold protection (windowed path and
+    speed both fall to ~0) while slow starts register in tens of ms.
+    """
+
+    def __init__(self, window_s=WINDOW_S):
+        self.window_s = window_s
+        self.samples = deque()
+
+    def reset(self):
+        self.samples.clear()
+
+    def add(self, t, pos):
+        self.samples.append((t, pos))
+        while self.samples and t - self.samples[0][0] > self.window_s:
+            self.samples.popleft()
+        path = 0.0
+        for (_, p0), (_, p1) in zip(self.samples, list(self.samples)[1:]):
+            path += math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        span = self.samples[-1][0] - self.samples[0][0] if len(self.samples) > 1 else 0.0
+        speed = path / span if span >= 0.02 else 0.0
+        return path, speed
+
+
+class LatencyStats:
+    """Code-side onset latency: observed input -> playback call return.
+
+    This deliberately excludes audible onset (Windows audio stack/speaker),
+    which code here cannot observe; that half needs the Windows retest.
+    """
+
+    def __init__(self):
+        self.onsets_ms = []
+
+    def record(self, started, ended):
+        self.onsets_ms.append((ended - started) * 1000.0)
+
+    def summary(self):
+        if not self.onsets_ms:
+            return "onsets=0"
+        avg = sum(self.onsets_ms) / len(self.onsets_ms)
+        return (f"onsets={len(self.onsets_ms)} avg={avg:.1f}ms "
+                f"max={max(self.onsets_ms):.1f}ms (observed->playback-call; "
+                f"audible onset not included)")
+
+
 # ----------------------------------------------------------------- audio ---
 class AudioError(Exception):
     """Playback failed; callers must surface this, never continue silently."""
 
 
-class WinsoundAudio:
-    """Fixed-volume looping playback via winsound.PlaySound (Windows only).
+def validate_volume(volume):
+    if isinstance(volume, bool) or not isinstance(volume, int) or not 0 <= volume <= 100:
+        raise AudioError(f"--volume must be an integer 0-100, got {volume!r}")
+    return volume
 
-    The previous MCI `waveaudio` backend sent `play ... repeat` and
-    `setaudio ... volume` commands that this device does not support and
-    discarded every MCI error code, so strokes were silent with no clue.
-    winsound has no per-loop volume control, so playback is at the WAV's
-    own (quiet) level: speed-based volume is not implemented.
+
+def prepare_scaled_wav(path, volume, out_dir=None):
+    """Return a playback path with app-only gain applied (once per launch).
+
+    100 returns the original file untouched; anything else writes one
+    gain-scaled temp copy (0 = all-zero samples). Windows/device volume
+    is never read or changed. Caller owns deleting the temp copy.
+    """
+    validate_volume(volume)
+    if volume == 100:
+        return path, False
+    try:
+        with wave.open(path, "rb") as wf:
+            params = wf.getparams()
+            frames = wf.readframes(wf.getnframes())
+        if params.sampwidth != 2:
+            raise AudioError(f"expected 16-bit WAV, got sampwidth={params.sampwidth}")
+        count = len(frames) // 2
+        samples = struct.unpack(f"<{count}h", frames)
+        gain = volume / 100.0
+        scaled = struct.pack(f"<{count}h", *(
+            int(max(-32768, min(32767, round(s * gain)))) for s in samples))
+        fd, tmp = tempfile.mkstemp(prefix="pencil_loop_vol", suffix=".wav",
+                                   dir=out_dir)
+        os.close(fd)
+        with wave.open(tmp, "wb") as wf:
+            wf.setparams(params)
+            wf.writeframes(scaled)
+    except (wave.Error, EOFError, OSError) as exc:
+        raise AudioError(f"preparing volume-scaled WAV failed: {exc}") from exc
+    return tmp, True
+
+
+class WinsoundAudio:
+    """Looping playback via winsound.PlaySound (Windows only).
+
+    Volume is app-only gain baked into one prepared copy at construction
+    (see prepare_scaled_wav); winsound itself has no volume control and
+    Windows volume is untouched. Speed-based volume is not implemented.
     """
 
-    def __init__(self, path, winsound_mod=None):
+    def __init__(self, path, winsound_mod=None, volume=100):
         if winsound_mod is None:
             try:
                 import winsound as winsound_mod
@@ -82,8 +175,13 @@ class WinsoundAudio:
         if not os.path.isfile(path):
             raise AudioError(f"WAV file not found: {path}")
         self._winsound = winsound_mod
-        self._path = path
+        self.volume = validate_volume(volume)
+        self._path, self._owns_copy = prepare_scaled_wav(path, volume)
         self._playing = False
+
+    @property
+    def play_path(self):
+        return self._path
 
     def play(self):
         ws = self._winsound
@@ -99,6 +197,12 @@ class WinsoundAudio:
 
     def close(self):
         self._stop()
+        if self._owns_copy:
+            self._owns_copy = False
+            try:
+                os.remove(self._path)
+            except OSError:
+                pass
 
     def _stop(self):
         if not self._playing:
@@ -192,10 +296,12 @@ class WindowsInput:
 
 
 # -------------------------------------------------------------- main loop --
-def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
+def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None,
+        clock=time.monotonic):
     gate = gate or StrokeGate()
-    prev_pos = input_src.cursor_pos()
-    prev_t = time.monotonic()
+    window = MovementWindow()
+    stats = LatencyStats()
+    input_src.cursor_pos()
     prev_f9 = False
     muted = False
     polls = 0
@@ -205,11 +311,14 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
         while max_polls is None or polls < max_polls:
             polls += 1
             sleep(POLL_S)
-            now = time.monotonic()
-            dt = max(now - prev_t, 1e-6)
+            poll_start = clock()
             pos = input_src.cursor_pos()
-            moved = math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1])
-            speed = moved / dt
+            down = input_src.left_button_down()
+            if down:
+                moved, speed = window.add(poll_start, pos)
+            else:
+                window.reset()
+                moved, speed = 0.0, 0.0
 
             f9 = input_src.key_down(VK_F9)
             if f9 and not prev_f9:
@@ -219,7 +328,7 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
 
             want = gate.decide(
                 input_src.foreground_is_clip_studio(),
-                input_src.left_button_down(),
+                down,
                 moved,
                 speed,
                 muted,
@@ -234,21 +343,46 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
                               "running silently. Run with --test-audio to "
                               "diagnose playback.", file=sys.stderr)
                         raise
+                    stats.record(poll_start, clock())
                     gate.playing = True
             elif gate.playing:
                 audio.pause()
                 gate.playing = False
-            prev_pos, prev_t = pos, now
     except KeyboardInterrupt:
         print("\nExiting.")
     finally:
         if gate.playing:
             audio.pause()
         audio.close()
+        print(f"Latency (code side): {stats.summary()}")
     return gate
 
 
-def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sleep):
+def parse_args(argv):
+    """Return (test_audio: bool, volume: int) or raise AudioError."""
+    test = False
+    volume = 100
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        if args[i] == "--test-audio":
+            test = True
+            i += 1
+        elif args[i] == "--volume":
+            if i + 1 >= len(args):
+                raise AudioError("--volume needs a value 0-100")
+            try:
+                volume = int(args[i + 1])
+            except ValueError:
+                raise AudioError(f"--volume must be an integer 0-100, got {args[i + 1]!r}")
+            i += 2
+        else:
+            raise AudioError(f"unknown argument: {args[i]}")
+    return test, validate_volume(volume)
+
+
+def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sleep,
+               volume=100):
     """Play the WAV unconditionally; return 0 only if no playback error.
 
     Needs no Clip Studio and no input, so it isolates 'can this PC play
@@ -259,15 +393,19 @@ def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sle
             print(f"ERROR: --test-audio requires Windows (winsound); "
                   f"this platform is '{sys.platform}'.", file=sys.stderr)
             return 2
-        audio_factory = WinsoundAudio
+        audio_factory = lambda p: WinsoundAudio(p, volume=volume)  # noqa: E731
     try:
         audio = audio_factory(path)
     except AudioError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 3
-    print(f"Playing {path} for {duration_s:.0f}s at fixed volume "
-          f"(speed-based volume not implemented). You should hear a quiet "
-          f"pencil scratch loop now...")
+    if volume == 0:
+        print(f"Playing {path} for {duration_s:.0f}s at --volume 0: this "
+              f"must be SILENT (gain applied once at launch).")
+    else:
+        print(f"Playing {path} for {duration_s:.0f}s at --volume {volume} "
+              f"(100 = WAV level; same gain as drawing mode). You should "
+              f"hear a quiet pencil scratch loop now...")
     try:
         audio.play()
         sleep(duration_s)
@@ -283,11 +421,15 @@ def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sle
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv == ["--test-audio"]:
-        return test_audio()
-    if argv:
-        print("Usage: python pencil_sound.py [--test-audio]", file=sys.stderr)
+    try:
+        test, volume = parse_args(argv)
+    except AudioError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("Usage: python pencil_sound.py [--test-audio] [--volume 0-100]",
+              file=sys.stderr)
         return 2
+    if test:
+        return test_audio(volume=volume)
     if sys.platform != "win32":
         print(
             "This prototype targets Windows (winsound + user32 polling).\n"
@@ -298,12 +440,13 @@ def main(argv=None):
         )
         return 2
     try:
-        audio = WinsoundAudio(WAV_PATH)
+        audio = WinsoundAudio(WAV_PATH, volume=volume)
     except AudioError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print("Run with --test-audio to diagnose playback.", file=sys.stderr)
         return 3
-    print("Fixed-volume playback; speed-based volume not implemented.")
+    print(f"App volume {volume}/100 (gain prepared once at launch; "
+          f"Windows volume untouched; speed-based volume not implemented).")
     try:
         run(WindowsInput(), audio)
     except AudioError:
