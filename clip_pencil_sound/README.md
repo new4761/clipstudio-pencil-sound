@@ -73,6 +73,17 @@ Launch/exit: from this folder run `python pencil_sound.py --volume 50`
 press **F9** to mute/unmute, and **Ctrl+C** to exit — on exit it prints
 the measured code-side onset latency (`Latency (code side): …`).
 
+Swap the sound without editing Python with `--sound <path-to-wav>` (works
+in drawing mode and with `--test-audio`; no flag = current default
+`pencil_loop.wav`, which is **not** replaced by any of this). Supported
+format: **uncompressed PCM WAV, 16-bit, mono or stereo, any sample
+rate**. Anything else (MP3, missing file, 8-bit, empty) fails at launch
+with a clear `ERROR:` and exit 3 — it never runs silently. See
+`samples/README.md` for adding recordings, MP3→WAV conversion of a copy,
+and the source/license table that must accompany every sample. Note:
+Jasper's Windows-only copy has extra F10/F11 volume keys; that copy is
+divergent and is left untouched by this repo.
+
 Requires Python 3 on the Windows PC (standard library only). Test on a
 **blank canvas**, not a real artwork.
 
@@ -125,13 +136,26 @@ ripped.
    If the pen draws but prints nothing, note the tablet model/driver/mode in
    the table above; the prototype's polling cannot see that pen, and the
    mouse result must not be read as pen support.
-2. `python pencil_sound.py --volume 50` — run the matrix below for pen,
+2. Real-recording test (optional, not the default): in
+   `Downloads\Pencil-Sounds-Recorded`, use the original WAV if present,
+   else `python samples\convert_to_wav.py "%USERPROFILE%\Downloads\Pencil-Sounds-Recorded\<file>.mp3"`,
+   then preview and draw with
+   `python pencil_sound.py --test-audio --volume 50 --sound <converted.wav>`
+   and `python pencil_sound.py --volume 50 --sound <converted.wav>`.
+   Any A/B/C candidate can be swapped in the same way, e.g.
+   `--sound sound_candidates\B_dry_textured.wav`.
+3. `python pencil_sound.py --volume 50` — run the matrix below for pen,
    then mouse, on a blank canvas. State which device each column used;
    the previous drawing test's device was unconfirmed, and a mouse pass
    never proves pen support. On Ctrl+C, copy the printed
    `Latency (code side): …` line into the report, and separately say
    whether the *audible* onset still feels delayed (that half is the
-   Windows audio path, not visible to the code-side number).
+   Windows audio path, not visible to the code-side number). Verify
+   dynamic response (start/stop/speed behavior) separately from sample
+   quality (tone, loop-seam click of the chosen file). This app reads
+   button + speed only: speed is not pressure, and no pressure support
+   is claimed unless real stylus pressure is shown readable without
+   driver/tablet-mode changes.
 
 ## Known limitation: canvas vs UI false positives
 
@@ -177,6 +201,7 @@ mouse separately, blank canvas:
 | Behaviour (blank canvas) | Pen | Mouse |
 |---|---|---|
 | `--test-audio --volume 100` heard / `--volume 50` quieter / `--volume 0` silent | Not tested | Not tested |
+| `--sound <recording.wav>` preview heard; bad/MP3 path shows clear `ERROR:` | Not tested | Not tested |
 | Drawing onset: starts promptly, no obvious delay (quote the printed code-side Latency line) | Not tested | Not tested |
 | Hover: quiet | Not tested | Not tested |
 | Stationary hold: quiet | Not tested | Not tested |

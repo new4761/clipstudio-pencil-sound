@@ -156,6 +156,32 @@ def prepare_scaled_wav(path, volume, out_dir=None):
     return tmp, True
 
 
+SUPPORTED_FORMAT = ("uncompressed PCM WAV, 16-bit, mono or stereo, any "
+                    "sample rate (MP3 etc. is not supported; convert a "
+                    "copy to PCM WAV first)")
+
+
+def validate_wav(path):
+    """Raise AudioError with a clear message unless path is a playable WAV."""
+    if not os.path.isfile(path):
+        raise AudioError(f"sound file not found: {path}")
+    try:
+        with wave.open(path, "rb") as wf:
+            comp, width, channels, frames = (
+                wf.getcomptype(), wf.getsampwidth(), wf.getnchannels(),
+                wf.getnframes())
+    except (wave.Error, EOFError, OSError) as exc:
+        raise AudioError(
+            f"cannot play '{path}': not a readable WAV ({exc}). "
+            f"Supported: {SUPPORTED_FORMAT}.") from exc
+    if comp != "NONE" or width != 2 or channels not in (1, 2) or frames == 0:
+        raise AudioError(
+            f"cannot play '{path}': need {SUPPORTED_FORMAT}; got "
+            f"compression={comp}, bits={width * 8}, channels={channels}, "
+            f"frames={frames}.")
+    return path
+
+
 class WinsoundAudio:
     """Looping playback via winsound.PlaySound (Windows only).
 
@@ -172,8 +198,7 @@ class WinsoundAudio:
                 raise AudioError(
                     "winsound is unavailable (this backend requires Windows)"
                 ) from exc
-        if not os.path.isfile(path):
-            raise AudioError(f"WAV file not found: {path}")
+        validate_wav(path)
         self._winsound = winsound_mod
         self.volume = validate_volume(volume)
         self._path, self._owns_copy = prepare_scaled_wav(path, volume)
@@ -359,9 +384,10 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None,
 
 
 def parse_args(argv):
-    """Return (test_audio: bool, volume: int) or raise AudioError."""
+    """Return (test_audio, volume, sound_path) or raise AudioError."""
     test = False
     volume = 100
+    sound = WAV_PATH
     args = list(argv)
     i = 0
     while i < len(args):
@@ -376,9 +402,14 @@ def parse_args(argv):
             except ValueError:
                 raise AudioError(f"--volume must be an integer 0-100, got {args[i + 1]!r}")
             i += 2
+        elif args[i] == "--sound":
+            if i + 1 >= len(args):
+                raise AudioError("--sound needs a path to a WAV file")
+            sound = args[i + 1]
+            i += 2
         else:
             raise AudioError(f"unknown argument: {args[i]}")
-    return test, validate_volume(volume)
+    return test, validate_volume(volume), sound
 
 
 def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sleep,
@@ -388,6 +419,11 @@ def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sle
     Needs no Clip Studio and no input, so it isolates 'can this PC play
     the file at all' from the foreground/button/movement gating.
     """
+    try:
+        validate_wav(path)
+    except AudioError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
     if audio_factory is None:
         if sys.platform != "win32":
             print(f"ERROR: --test-audio requires Windows (winsound); "
@@ -422,14 +458,14 @@ def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sle
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        test, volume = parse_args(argv)
+        test, volume, sound = parse_args(argv)
     except AudioError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        print("Usage: python pencil_sound.py [--test-audio] [--volume 0-100]",
-              file=sys.stderr)
+        print("Usage: python pencil_sound.py [--test-audio] [--volume 0-100] "
+              "[--sound path.wav]", file=sys.stderr)
         return 2
     if test:
-        return test_audio(volume=volume)
+        return test_audio(path=sound, volume=volume)
     if sys.platform != "win32":
         print(
             "This prototype targets Windows (winsound + user32 polling).\n"
@@ -440,11 +476,12 @@ def main(argv=None):
         )
         return 2
     try:
-        audio = WinsoundAudio(WAV_PATH, volume=volume)
+        audio = WinsoundAudio(sound, volume=volume)
     except AudioError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print("Run with --test-audio to diagnose playback.", file=sys.stderr)
         return 3
+    print(f"Sound: {sound}")
     print(f"App volume {volume}/100 (gain prepared once at launch; "
           f"Windows volume untouched; speed-based volume not implemented).")
     try:

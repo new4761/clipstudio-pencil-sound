@@ -6,6 +6,8 @@ release stops, Alt-Tab (foreground loss) stops, mute silences, the
 winsound backend (correct loop flags, errors surfaced not swallowed),
 and --test-audio success/failure. Run: python test_logic.py
 """
+import os
+
 import pencil_sound as ps
 
 
@@ -126,9 +128,17 @@ def main():
 
     # --volume: parsing, gain math, once-per-launch preparation.
     ok &= check("parse --test-audio --volume 50",
-                ps.parse_args(["--test-audio", "--volume", "50"]) == (True, 50))
-    ok &= check("parse default volume 100", ps.parse_args([]) == (False, 100))
-    for bad in (["--volume", "101"], ["--volume", "-1"], ["--volume", "x"], ["--bogus"]):
+                ps.parse_args(["--test-audio", "--volume", "50"]) == (True, 50, ps.WAV_PATH))
+    ok &= check("parse defaults (default sound kept)",
+                ps.parse_args([]) == (False, 100, ps.WAV_PATH))
+    cand_a = os.path.join(os.path.dirname(ps.WAV_PATH),
+                          "sound_candidates", "A_soft_smooth.wav")
+    ok &= check("parse --sound accepts a path in both modes",
+                ps.parse_args(["--sound", cand_a]) == (False, 100, cand_a)
+                and ps.parse_args(["--test-audio", "--volume", "50",
+                                   "--sound", cand_a]) == (True, 50, cand_a))
+    for bad in (["--volume", "101"], ["--volume", "-1"], ["--volume", "x"],
+                ["--bogus"], ["--sound"], ["--volume"]):
         try:
             ps.parse_args(bad)
             rejected = False
@@ -198,6 +208,34 @@ def main():
     stats.record(1.000, 1.004)
     ok &= check("latency stats report code-side ms only",
                 "avg=4.0ms" in stats.summary() and "audible onset not included" in stats.summary())
+
+    # --sound: validation and interchangeable-file playback path.
+    ok &= check("validate_wav accepts a candidate WAV",
+                ps.validate_wav(cand_a) == cand_a)
+    for bad_path, why in ((cand_a + ".missing.wav", "missing file"),
+                          (os.path.abspath(__file__), "non-WAV file")):
+        try:
+            ps.validate_wav(bad_path)
+            rejected = False
+            msg = ""
+        except ps.AudioError as exc:
+            rejected, msg = True, str(exc)
+        ok &= check(f"validate_wav rejects {why} with clear error",
+                    bool(rejected and "Supported:" in msg or rejected and "not found" in msg))
+    seen = {}
+
+    def recording_factory(path):
+        seen["path"] = path
+        return ps.WinsoundAudio(path, winsound_mod=FakeWinsound(), volume=50)
+
+    ok &= check("--test-audio --sound plays the chosen file",
+                ps.test_audio(path=cand_a, audio_factory=recording_factory,
+                              sleep=lambda _s: None, volume=50) == 0
+                and seen.get("path") == cand_a)
+    ok &= check("--test-audio with bogus --sound exits 3 (clear error)",
+                ps.test_audio(path="no_such_sound.wav",
+                              audio_factory=recording_factory,
+                              sleep=lambda _s: None) == 3)
 
     # End-to-end through the poll loop: stroke, lift, Alt-Tab.
     script = (
