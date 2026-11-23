@@ -2,8 +2,9 @@
 """Headless tests for the gating logic (no Windows, pen or audio needed).
 
 Covers: hover quiet, stationary hold quiet, moving stroke sounds,
-release stops, Alt-Tab (foreground loss) stops, mute silences, and
-volume rising with stroke speed. Run: python test_logic.py
+release stops, Alt-Tab (foreground loss) stops, mute silences, the
+winsound backend (correct loop flags, errors surfaced not swallowed),
+and --test-audio success/failure. Run: python test_logic.py
 """
 import pencil_sound as ps
 
@@ -53,8 +54,63 @@ def main():
     ok &= check("moving stroke sounds", g.decide(True, True, 10, 300, False))
     ok &= check("background app is quiet", not g.decide(False, True, 10, 300, False))
     ok &= check("muted stroke is quiet", not g.decide(True, True, 10, 300, True))
-    ok &= check("slow stroke quieter than fast",
-                ps.StrokeGate.volume_for_speed(40) < ps.StrokeGate.volume_for_speed(800))
+
+    # winsound backend: looping flags, purge-on-stop, surfaced errors.
+    class FakeWinsound:
+        SND_FILENAME, SND_ASYNC, SND_LOOP, SND_NODEFAULT, SND_PURGE = 1, 2, 4, 8, 16
+
+        def __init__(self, fail=False):
+            self.calls = []
+            self.fail = fail
+
+        def PlaySound(self, path, flags):
+            self.calls.append((path, flags))
+            if self.fail:
+                raise RuntimeError("no audio device")
+
+    fake = FakeWinsound()
+    backend = ps.WinsoundAudio(ps.WAV_PATH, winsound_mod=fake)
+    backend.play()
+    played_path, played_flags = fake.calls[0]
+    ok &= check("winsound plays WAV async+loop",
+                bool(played_path == ps.WAV_PATH
+                     and played_flags & fake.SND_LOOP and played_flags & fake.SND_ASYNC))
+    backend.pause()
+    ok &= check("winsound stop purges sound", fake.calls[-1] == (None, fake.SND_PURGE))
+    try:
+        ps.WinsoundAudio(ps.WAV_PATH, winsound_mod=FakeWinsound(fail=True)).play()
+        raised = False
+    except ps.AudioError:
+        raised = True
+    ok &= check("winsound failure raises AudioError (not silent)", raised)
+    try:
+        ps.WinsoundAudio("no_such_file.wav", winsound_mod=FakeWinsound())
+        missing = False
+    except ps.AudioError:
+        missing = True
+    ok &= check("missing WAV raises AudioError", missing)
+    ok &= check("--test-audio succeeds with working backend",
+                ps.test_audio(audio_factory=lambda p: ps.WinsoundAudio(p, winsound_mod=FakeWinsound()),
+                              sleep=lambda _s: None) == 0)
+    ok &= check("--test-audio reports failure (exit 3, no silent pass)",
+                ps.test_audio(audio_factory=lambda p: ps.WinsoundAudio(p, winsound_mod=FakeWinsound(fail=True)),
+                              sleep=lambda _s: None) == 3)
+
+    # Playback failure mid-run must propagate, not run on silently.
+    class BrokenAudio(ps.NullAudio):
+        def play(self):
+            raise ps.AudioError("boom")
+
+    stroke = ([(True, False, (0.0, 0.0), False)]
+              + [(True, True, (float(x * 8), 0.0), False) for x in range(1, 5)])
+    fake_in = FakeInput(stroke)
+    try:
+        ps.run(fake_in, BrokenAudio(), sleep=lambda _s: setattr(fake_in, "i", fake_in.i + 1),
+               max_polls=len(stroke))
+        propagated = False
+    except ps.AudioError:
+        propagated = True
+    ok &= check("run() propagates AudioError", propagated)
 
     # End-to-end through the poll loop: stroke, lift, Alt-Tab.
     script = (

@@ -6,10 +6,13 @@ Plays a quiet looping scratch ONLY while all of these are true:
   * the left button (mouse or pen-as-mouse) is held down, and
   * the pointer is actually moving.
 
-It stops/fades on pause, button release, foreground loss (e.g. Alt-Tab),
-or mute (F9). It only *polls* input state (GetAsyncKeyState / GetCursorPos);
-it never injects, hooks, or blocks input. No admin rights, no driver or
-settings changes, no auto-start: run it, draw, Ctrl+C to quit.
+It stops on pause, button release, foreground loss (e.g. Alt-Tab), mute
+(F9), and exit. Playback is fixed-volume `winsound.PlaySound` looping;
+speed-based volume is NOT implemented in this pass. It only *polls* input
+state (GetAsyncKeyState / GetCursorPos); it never injects, hooks, or blocks
+input. No admin rights, no driver or settings changes, no auto-start:
+run it, draw, Ctrl+C to quit. `--test-audio` plays the WAV for 4 seconds
+with no Clip Studio or input needed, to verify sound output itself.
 
 Limitation: a foreground check cannot tell the canvas apart from the
 toolbar/menus, so dragging a slider or title bar inside Clip Studio will
@@ -30,9 +33,6 @@ WAV_PATH = os.path.join(HERE, "pencil_loop.wav")
 POLL_S = 0.02            # 50 Hz polling
 MOVE_MIN_PX = 2.0        # ignore sub-pixel jitter
 SPEED_MIN_PX_S = 15.0    # below this the stroke counts as stationary
-SPEED_FULL_PX_S = 900.0  # speed mapped to full (still quiet) volume
-VOLUME_MAX = 350         # MCI volume 0..1000; kept deliberately quiet
-FADE_STEP = 90           # volume removed per poll while fading out
 
 VK_LBUTTON = 0x01
 VK_F9 = 0x78
@@ -55,46 +55,59 @@ class StrokeGate:
         )
         return want
 
-    @staticmethod
-    def volume_for_speed(speed_px_s):
-        t = (speed_px_s - SPEED_MIN_PX_S) / (SPEED_FULL_PX_S - SPEED_MIN_PX_S)
-        t = max(0.0, min(1.0, t))
-        return int(60 + t * (VOLUME_MAX - 60))
-
 
 # ----------------------------------------------------------------- audio ---
-class MciAudio:
-    """Looping WAV playback with volume control via Windows MCI (winmm)."""
+class AudioError(Exception):
+    """Playback failed; callers must surface this, never continue silently."""
 
-    def __init__(self, path):
-        import ctypes
-        self._mci = ctypes.windll.winmm.mciSendStringW
+
+class WinsoundAudio:
+    """Fixed-volume looping playback via winsound.PlaySound (Windows only).
+
+    The previous MCI `waveaudio` backend sent `play ... repeat` and
+    `setaudio ... volume` commands that this device does not support and
+    discarded every MCI error code, so strokes were silent with no clue.
+    winsound has no per-loop volume control, so playback is at the WAV's
+    own (quiet) level: speed-based volume is not implemented.
+    """
+
+    def __init__(self, path, winsound_mod=None):
+        if winsound_mod is None:
+            try:
+                import winsound as winsound_mod
+            except ImportError as exc:
+                raise AudioError(
+                    "winsound is unavailable (this backend requires Windows)"
+                ) from exc
+        if not os.path.isfile(path):
+            raise AudioError(f"WAV file not found: {path}")
+        self._winsound = winsound_mod
         self._path = path
-        self._volume = 0
-        self._send(f'open "{path}" type waveaudio alias pencil')
-        self._send("set pencil time format milliseconds")
-
-    def _send(self, cmd):
-        import ctypes
-        buf = ctypes.create_unicode_buffer(256)
-        self._mci(cmd, buf, 256, None)
-
-    def set_volume(self, vol):
-        self._volume = max(0, min(1000, int(vol)))
-        self._send(f"setaudio pencil volume to {self._volume}")
+        self._playing = False
 
     def play(self):
-        self._send("play pencil repeat")
+        ws = self._winsound
+        flags = ws.SND_FILENAME | ws.SND_ASYNC | ws.SND_LOOP | ws.SND_NODEFAULT
+        try:
+            ws.PlaySound(self._path, flags)
+        except (RuntimeError, OSError) as exc:
+            raise AudioError(f"winsound.PlaySound failed for {self._path}: {exc}") from exc
+        self._playing = True
 
     def pause(self):
-        self._send("pause pencil")
+        self._stop()
 
     def close(self):
+        self._stop()
+
+    def _stop(self):
+        if not self._playing:
+            return
+        self._playing = False
         try:
-            self._send("stop pencil")
-            self._send("close pencil")
-        except Exception:
-            pass
+            self._winsound.PlaySound(None, self._winsound.SND_PURGE)
+        except (RuntimeError, OSError) as exc:
+            print(f"WARNING: stopping playback failed: {exc}", file=sys.stderr)
 
 
 class NullAudio:
@@ -185,7 +198,6 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
     prev_t = time.monotonic()
     prev_f9 = False
     muted = False
-    fading_to = None
     polls = 0
     print("Running. Draw in Clip Studio Paint to hear the pencil. "
           "F9 = mute/unmute, Ctrl+C = exit.")
@@ -213,24 +225,19 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
                 muted,
             )
             if want:
-                target = StrokeGate.volume_for_speed(speed)
                 if not gate.playing:
-                    audio.set_volume(target)
-                    audio.play()
+                    try:
+                        audio.play()
+                    except AudioError as exc:
+                        print(f"ERROR: {exc}", file=sys.stderr)
+                        print("Sound output failed; exiting instead of "
+                              "running silently. Run with --test-audio to "
+                              "diagnose playback.", file=sys.stderr)
+                        raise
                     gate.playing = True
-                    fading_to = None
-                else:
-                    audio.set_volume(target)
             elif gate.playing:
-                # Fade quickly, then pause, so lifts and Alt-Tab end cleanly.
-                fading_to = (fading_to if fading_to is not None else VOLUME_MAX) - FADE_STEP
-                if fading_to <= 0:
-                    audio.set_volume(0)
-                    audio.pause()
-                    gate.playing = False
-                    fading_to = None
-                else:
-                    audio.set_volume(fading_to)
+                audio.pause()
+                gate.playing = False
             prev_pos, prev_t = pos, now
     except KeyboardInterrupt:
         print("\nExiting.")
@@ -241,20 +248,66 @@ def run(input_src, audio, gate=None, sleep=time.sleep, max_polls=None):
     return gate
 
 
-def main():
+def test_audio(path=WAV_PATH, duration_s=4.0, audio_factory=None, sleep=time.sleep):
+    """Play the WAV unconditionally; return 0 only if no playback error.
+
+    Needs no Clip Studio and no input, so it isolates 'can this PC play
+    the file at all' from the foreground/button/movement gating.
+    """
+    if audio_factory is None:
+        if sys.platform != "win32":
+            print(f"ERROR: --test-audio requires Windows (winsound); "
+                  f"this platform is '{sys.platform}'.", file=sys.stderr)
+            return 2
+        audio_factory = WinsoundAudio
+    try:
+        audio = audio_factory(path)
+    except AudioError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
+    print(f"Playing {path} for {duration_s:.0f}s at fixed volume "
+          f"(speed-based volume not implemented). You should hear a quiet "
+          f"pencil scratch loop now...")
+    try:
+        audio.play()
+        sleep(duration_s)
+    except AudioError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
+    finally:
+        audio.close()
+    print("Playback finished without an error. If you heard nothing, check "
+          "the Windows output device and volume mixer, then re-run.")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv == ["--test-audio"]:
+        return test_audio()
+    if argv:
+        print("Usage: python pencil_sound.py [--test-audio]", file=sys.stderr)
+        return 2
     if sys.platform != "win32":
         print(
-            "This prototype targets Windows (winmm/MCI + user32 polling).\n"
+            "This prototype targets Windows (winsound + user32 polling).\n"
             f"Current platform is '{sys.platform}', so audio and pen input "
             "cannot be exercised here.\n"
             "Run test_logic.py to verify the gating logic, and run this file "
             "on the Windows PC to test the real stylus."
         )
         return 2
-    if not os.path.exists(WAV_PATH):
-        print(f"Missing {WAV_PATH}. Run: python generate_wav.py")
-        return 2
-    run(WindowsInput(), MciAudio(WAV_PATH))
+    try:
+        audio = WinsoundAudio(WAV_PATH)
+    except AudioError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("Run with --test-audio to diagnose playback.", file=sys.stderr)
+        return 3
+    print("Fixed-volume playback; speed-based volume not implemented.")
+    try:
+        run(WindowsInput(), audio)
+    except AudioError:
+        return 3
     return 0
 
 
